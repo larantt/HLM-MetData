@@ -308,6 +308,42 @@ def check_request(model, lead_time, event_time, dt, strict=True):
             )
         # no need to check dt because HRRR is hourly
 
+def write_file(path, content):
+    #os.makedirs(os.path.dirname(path), exist_ok=True)  # CHECK ON THIS
+    with open(path, "w") as f:
+        f.write(content)
+
+def write_metadata(model_name, pr_ds, t2m_ds, outpath, 
+                   pr_path, t2m_path, start_time, lead_time, event_time, dt):
+    """
+    Function writes a metadata file for use with the 
+    yaml data needed for mapping indices to the links
+
+    Parameters
+    ----------
+    """
+    template = f"""
+    Metadata for {model_name} forecast with {lead_time}h lead time
+
+    start: "{start_time}"
+    end: "{event_time}"
+    path: "{outpath}"
+    
+    variables:
+    - name: "pr"
+      file: "{pr_path}"
+      time_resolution: "{dt}h"
+      dims: {", ".join(pr_ds.dims)}
+
+    - name: "t2m"
+      file: "{t2m_path}"
+      time_resolution: "24h"
+      dims: {", ".join(t2m_ds.dims)}
+"""
+    write_file(f"{outpath}/metadata-{model_name}_{lead_time}h_lead.yaml", template)
+
+
+
 def download_hrrr(event_time, lead_time, outpath, dt=1, 
                   verbose=1, max_threads=50, crop_domain=True,
                   lat_max=41.024, lat_min=40.185, lon_max=-74.229, lon_min=-75.055):
@@ -337,7 +373,7 @@ def download_hrrr(event_time, lead_time, outpath, dt=1,
     # STEP 1: calculate the correct forecast hour and lead time
     # make sure to check the start time for the max_fxx
     start_time = _calc_fcst_init(event_time, lead_time)
-    valid_start = start_time + timedelta(hours=1)
+    valid_start = start_time + timedelta(hours=dt)
     
     if verbose:
         print(f"Downloading HRRR initialized at {start_time}")
@@ -423,8 +459,23 @@ def download_hrrr(event_time, lead_time, outpath, dt=1,
 
     # write to netcdf - filename is <PRODUCT>-<START>-<END>-<LEADTIME>.nc
     
-    apcp_df.to_netcdf(f'{outpath}/hrrr_pr_hrly_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
-    t2m_df.to_netcdf(f'{outpath}/hrrr_t2m_daily_avg_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
+    apcp_path = f'/hrrr_pr_hrly_{valid_start.strftime('%Y%m%d')}_{_parse_event_time(event_time).strftime('%Y%m%d')}.nc'
+    t2m_path = f'/hrrr_t2m_daily_avg_{valid_start.strftime('%Y%m%d')}_{_parse_event_time(event_time).strftime('%Y%m%d')}.nc'
+
+    apcp_df.to_netcdf(f'{outpath}/{apcp_path}')
+    t2m_df.to_netcdf(f'{outpath}/{t2m_path}')
+
+    # write the metadata file
+    write_metadata(model_name='hrrr', 
+                   pr_ds=apcp_df, 
+                   t2m_ds=t2m_df, 
+                   outpath=outpath, 
+                   pr_path=apcp_path, 
+                   t2m_path=t2m_path,
+                   start_time=valid_start.strftime('%Y%m%d %H:%M'), 
+                   lead_time=lead_time,
+                   event_time=_parse_event_time(event_time).strftime('%Y%m%d  %H:%M'),
+                   dt=dt)
 
     return apcp_df, t2m_df
 
@@ -461,7 +512,7 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
     # STEP 1: calculate the correct forecast hour and lead time
     # make sure to check the start time for the max_fxx
     start_time = _calc_fcst_init(event_time, lead_time)
-    valid_start = start_time + timedelta(hours=1)
+    valid_start = start_time + timedelta(hours=dt)
 
     if verbose:
         print(f"Downloading GFS initialized at {start_time}")
@@ -533,9 +584,23 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
     # TO DO!!! write a metadata file detailing the parameters
 
     # write to netcdf - filename is <PRODUCT>-<START>-<END>.nc
-    
-    apcp_df.to_netcdf(f'{outpath}/gfs_pr_hrly_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
-    t2m_df.to_netcdf(f'{outpath}/gfs_t2m_daily_avg_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
+    apcp_path = f'/gfs_pr_hrly_{valid_start.strftime('%Y%m%d')}_{_parse_event_time(event_time).strftime('%Y%m%d')}.nc'
+    t2m_path = f'/gfs_t2m_daily_avg_{valid_start.strftime('%Y%m%d')}_{_parse_event_time(event_time).strftime('%Y%m%d')}.nc'
+
+    apcp_df.to_netcdf(f'{outpath}/{apcp_path}')
+    t2m_df.to_netcdf(f'{outpath}/{t2m_path}')
+
+    # write the metadata file
+    write_metadata(model_name='gfs', 
+                   pr_ds=apcp_df, 
+                   t2m_ds=t2m_df, 
+                   outpath=outpath, 
+                   pr_path=apcp_path, 
+                   t2m_path=t2m_path,
+                   start_time=valid_start.strftime('%Y%m%d %H:%M'), 
+                   lead_time=lead_time,
+                   event_time=_parse_event_time(event_time).strftime('%Y%m%d  %H:%M'),
+                   dt=dt)
 
     return apcp_df, t2m_df
 
@@ -610,18 +675,21 @@ def download_driver(model_dict, event_time, outpath, req_models, crop_region,
         
         if mod_name == 'GFS'.casefold():
             for lead in mod_opts['LEAD_TIMES']:
+                outpath_inner = f"{outpath}/gfs/lead-time_{lead}hrs"
+
                 _,_ = download_gfs(
                             EVENT_TIME, lead,
-                            outpath, dt=mod_opts['dt'], crop_domain=crop_region,
+                            outpath_inner, dt=mod_opts['dt'], crop_domain=crop_region,
                             lat_max=lat_max, lat_min=lat_min,
                             lon_max=lon_max, lon_min=lon_min
                             )
                 
         if mod_name == 'HRRR'.casefold():
             for lead in mod_opts['LEAD_TIMES']:
+                outpath_inner = f"{outpath}/hrrr/lead-time_{lead}hrs"
                 _,_ = download_hrrr(
                             EVENT_TIME, lead, 
-                            outpath, dt=mod_opts['dt'], crop_domain=crop_region,
+                            outpath_inner, dt=mod_opts['dt'], crop_domain=crop_region,
                             lat_max=lat_max, lat_min=lat_min,
                             lon_max=lon_max, lon_min=lon_min
                             )
@@ -634,8 +702,8 @@ def download_driver(model_dict, event_time, outpath, req_models, crop_region,
 
 # REQUIRED SETTINGS
 EVENT_TIME = "2021-09-03 00:00"  # YYYY-MM-DD hh:mm (when does the EVENT we are back forecasting happen)
-OUTPATH = '/home/lt0663/Documents/hlm_forecast/data/gfs_checker'  # where to save out the datasets
-MODELS_TO_PULL = ['gfs']   # which of the supported models to download at this time
+OUTPATH = '/home/lt0663/Documents/hlm_forecast/data/meta_checker'  # where to save out the datasets
+MODELS_TO_PULL = ['hrrr', 'gfs']   # which of the supported models to download at this time
 
 # OPTIONAL CHANGES - currently same as function defaults
 CROP_REGION = True                      # do you want a subset of the full model domain when you download?
@@ -647,12 +715,12 @@ LAT_MIN, LAT_MAX = 40.185, 41.024       # minimum and maximum latitude (set for 
 #       dt : hours (interval between model steps to download at each lead time i.e. frequency of input to HLM)
 MODELS = {
     'gfs' : {
-        'LEAD_TIMES' : np.arange(72,0,-12).tolist(),  # between 0 and 240, must be a multiple of 6 for GFS (runs available at 0z, 6z, 12z, 18z)
+        'LEAD_TIMES' : [72, 48], #np.arange(72,0,-12).tolist(),  # between 0 and 240, must be a multiple of 6 for GFS (runs available at 0z, 6z, 12z, 18z)
         'dt' : 3                   # must be a multiple of 6 for GFS (minimum is 6 hours)
     },
 
     'hrrr' : {
-        'LEAD_TIMES' : np.arange(48,0,-12).tolist(),  # between 0 and 48, but 18-48 hours are only available for 0, 6, 12, 18Z runs
+        'LEAD_TIMES' : [36, 12], #np.arange(48,0,-12).tolist(),  # between 0 and 48, but 18-48 hours are only available for 0, 6, 12, 18Z runs
         'dt' : 1                      # any because HRRR is hourly (minimum is 1 hour)
     }
 }
