@@ -66,12 +66,14 @@ even if it just turns out to be a simple fix, in which case you can include the 
 This way we can identify common errors associated with data stores and improve the code as a 
 group without too much back and forth.
 """
+import warnings
 from datetime import datetime, timedelta
 import os
 
 import numpy as np
 from herbie import Herbie, FastHerbie
 import xarray as xr
+xr.set_options(use_new_combine_kwarg_defaults=False)
 
 ### IMPORTANT GLOBALS FOR DOWNLOAD ###
 avail_models = ['hrrr', 'rap', 'gfs', 'nbm', 'rrfs', 'href', 'hiresw',
@@ -132,6 +134,31 @@ _ALLOWED_FORMATS = (
     "%Y%m%d %H",
 )
 
+def snap_to_prev_cycle(start_time):
+    cycles = (0, 6, 12, 18)
+
+    # If already on a cycle, no change
+    if start_time.hour in cycles:
+        snapped = start_time.replace(minute=0, second=0, microsecond=0)
+    else:
+        # cycles before current hour
+        prev_cycles = [h for h in cycles if h <= start_time.hour]
+
+        if prev_cycles:
+            snapped_hour = max(prev_cycles)
+            snapped = start_time.replace(
+                hour=snapped_hour, minute=0, second=0, microsecond=0
+            )
+        else:
+            # before 00 UTC → go to 18 UTC previous day
+            snapped = (start_time - timedelta(days=1)).replace(
+                hour=18, minute=0, second=0, microsecond=0
+            )
+
+    hour_diff = int((start_time - snapped).total_seconds() // 3600)
+    return snapped, hour_diff
+
+
 def _parse_event_time(event_time: str) -> datetime:
     """
     Safely parse event_time using a whitelist of formats.
@@ -191,7 +218,7 @@ def to_360(lon):
     """
     return lon + 360 if lon < 0 else lon
 
-def check_request(model, lead_time, event_time, dt):
+def check_request(model, lead_time, event_time, dt, strict=True):
     """
     Function checks to see if the submitted request is valid.
     Right now, this only supports hindcasts.
@@ -212,24 +239,47 @@ def check_request(model, lead_time, event_time, dt):
 
     # now check all the parameters
     if model == 'GFS'.casefold():
-        print("Validating GFS ")
-        if lead_time > 384:
-            # GFS goes to 384 hours out
+        print("Validating GFS request...")
+        if lead_time > 240:
+            # GFS goes to 240 hours out (technically 384 but I don't think we should be trusting precip that long term)
             raise ValueError(
                 f"Maximum forecast hours ({lead_time}) are invalid for "
                 f"{start_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-                "Ensure GFS lead_time is between 1 and 384.\n"
+                "Ensure GFS lead_time is between 1 and 240.\n"
                 f"See https://www.emc.ncep.noaa.gov/emc/pages/numerical_forecast_systems/gfs.php for more"
             )
-        if dt % 6 != 0:
+        
+        #if lead_time % 6 != 0:
+        if start_time.hour not in (0, 6, 12, 18):
+            # If strict (default), fail unless an analysis is available at the requested initialization time
+            # If not strict, find the nearest valid initialization before the requested lead time, 
+            # and print a user warning stating the actual initialization time and the timestep the model will
+            # begin at to achieve the requested lead time (???) this is presumably helpful behavior?
+            if strict:
+                raise ValueError(
+                    f"Initialization at {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"is invalid for GFS, which must start at 0, 6, 12 or 18Z. "
+                    f"See https://www.emc.ncep.noaa.gov/emc/pages/numerical_forecast_systems/gfs.php for more"
+                )
+            else: 
+                # get the new init and start dt
+                new_init, new_start_dt = snap_to_prev_cycle(start_time)
+                warnings.warn(
+                    f"GFS lead time of {lead_time} will start in the middle of the run"
+                    f"New init time will be {new_init.strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"Model will start at new simulation hour: {new_start_dt}"
+                    )
+
+        if dt % 3 != 0:
             # GFS timestep is 6 hourly so dt must be a multiple of 6
             raise ValueError(
                 f"Timestep of dt = {dt} is invalid for GFS data"
-                f"GFS has a 6 hour timestep, so ensure dt is a multiple of 6\n"
+                f"GFS has a 3 hour timestep, so ensure dt is a multiple of 6\n"
                 f"See https://www.emc.ncep.noaa.gov/emc/pages/numerical_forecast_systems/gfs.php for more"
             )
         
     if model == 'HRRR'.casefold():
+        print('Validating HRRR request...')
         # HRRR intermediate cycles (01–05, 07–11, 13–17, 19–23 UTC)
         if start_time.hour not in (0, 6, 12, 18) and lead_time > 18:
             raise ValueError(
@@ -288,28 +338,6 @@ def download_hrrr(event_time, lead_time, outpath, dt=1,
     # make sure to check the start time for the max_fxx
     start_time = _calc_fcst_init(event_time, lead_time)
     valid_start = start_time + timedelta(hours=1)
-
-    if lead_time > 48:
-        raise ValueError(
-            f"Maximum forecast hours ({lead_time}) are invalid for "
-            f"{start_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-            "Ensure lead_time is between 1 and 48."
-        )
-
-    if start_time.year < 2021 and lead_time > 36:
-        raise ValueError(
-            f"Maximum forecast hours ({lead_time}) are invalid for "
-            f"{start_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-            "Ensure lead_time is between 0 and 36 prior to 2021."
-        )
-
-    # HRRR intermediate cycles (01–05, 07–11, 13–17, 19–23 UTC)
-    if start_time.hour not in (0, 6, 12, 18) and lead_time > 18:
-        raise ValueError(
-            f"Maximum forecast hours ({lead_time}) are invalid for "
-            f"{start_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-            "Ensure lead_time is between 1 and 18 for intermediate init times."
-        )
     
     if verbose:
         print(f"Downloading HRRR initialized at {start_time}")
@@ -325,7 +353,7 @@ def download_hrrr(event_time, lead_time, outpath, dt=1,
         DATES=[start_time],
         model='hrrr',
         product='sfc',
-        fxx=np.arange(1, lead_time+dt, dt).tolist(),  # you need to start at fxx=1 bc no precip at initialization (it accumulates in time)
+        fxx=np.arange(dt, lead_time+dt, dt).tolist(),  # you need to start at fxx=1 bc no precip at initialization (it accumulates in time)
         max_threads=max_threads,
         save_dir=f"{outpath}/raw"
     )
@@ -342,7 +370,7 @@ def download_hrrr(event_time, lead_time, outpath, dt=1,
     # you will just have to assume that HLM starts one model timestep
     # after the atmospheric model initalization as at fxx=0 there is no 
     # accumulated precipitation
-    apcp_df = apcp_df.diff(dim='valid_time', n=dt)
+    apcp_df = apcp_df.diff(dim='valid_time')
 
     # convert to units of mm/hr and region crop
     apcp_df['tp'] = apcp_df['tp'] / float(dt)
@@ -435,13 +463,6 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
     start_time = _calc_fcst_init(event_time, lead_time)
     valid_start = start_time + timedelta(hours=1)
 
-    if lead_time > 384:
-        raise ValueError(
-            f"Maximum forecast hours ({lead_time}) are invalid for "
-            f"{start_time.strftime('%Y-%m-%d %H:%M:%S')}. "
-            "Ensure lead_time is between 1 and 384."
-        )
-    
     if verbose:
         print(f"Downloading GFS initialized at {start_time}")
         print(f"Valid: {valid_start} to {event_time} ({lead_time - dt}h lead time)")
@@ -456,7 +477,7 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
         DATES=[start_time],
         model='gfs',
         product='pgrb2.0p25',
-        fxx=np.arange(1, lead_time+dt, dt).tolist(),  # you need to start at fxx=1 bc no precip at initialization (it accumulates in time)
+        fxx=np.arange(dt, lead_time+dt, dt).tolist(),  # you need to start at fxx=1 bc no precip at initialization (it accumulates in time)
         max_threads=max_threads,
         save_dir=f"{outpath}/raw"
     )
@@ -465,14 +486,24 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
     apcp_df = FH.xarray(r":APCP:")
     t2m_df = FH.xarray(r":TMP:2 m above")
 
+    apcp_df = apcp_df.swap_dims({"step": "valid_time"})
+    apcp_df = apcp_df.drop_vars("step")
+    #apcp_df = apcp_df.rename({"valid_time": "time"})
+
+    t2m_df = t2m_df.swap_dims({"step": "valid_time"})
+    t2m_df = t2m_df.drop_vars("step")
+    #t2m_df = t2m_df.rename({"valid_time": "time"})
+
+
     # STEP 3: deal with precipitation accumulation (timestep accum -> mm/h),
     # you will just have to assume that HLM starts one model timestep
     # after the atmospheric model initalization as at fxx=0 there is no 
     # accumulated precipitation
-    apcp_df = apcp_df.diff(dim='valid_time', n=dt)
+    apcp_df = apcp_df.diff(dim='valid_time')
 
     # convert to units of mm/hr and region crop
     apcp_df['tp'] = apcp_df['tp'] / float(dt)
+
 
     apcp_df['tp'].attrs['units'] = 'mm/hr'
     apcp_df['tp'].attrs['long_name'] = 'Hourly precipitation rate from total accumulated precipitation'
@@ -501,7 +532,7 @@ def download_gfs(event_time, lead_time, outpath, dt=6,
 
     # TO DO!!! write a metadata file detailing the parameters
 
-    # write to netcdf - filename is <PRODUCT>-<START>-<END>-<LEADTIME>.nc
+    # write to netcdf - filename is <PRODUCT>-<START>-<END>.nc
     
     apcp_df.to_netcdf(f'{outpath}/gfs_pr_hrly_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
     t2m_df.to_netcdf(f'{outpath}/gfs_t2m_daily_avg_{valid_start.strftime('%Y%m%d%H')}_{_parse_event_time(event_time).strftime('%Y%m%d%H%M')}.nc')
@@ -538,42 +569,104 @@ def download_NOGAPS():
 def download_HAFS():
     pass
 
-def download_driver():
+def download_driver(model_dict, event_time, outpath, req_models, crop_region,
+                    lat_max, lat_min, lon_max, lon_min):
     """
-    Function downloads 
-    """
-    pass
+    Function is a driver to download the requested HLM data. I guess this
+    could be multiprocessed, but I highly reccomend against this since
+    Herbie itself is multithreaded and if the model is on a NOAA or NCEI
+    ftp it can rate limit and block you (whoops......)
 
-###############
-### GLOBALS ###
-###############
+    Parameters
+    ----------
+    model_dict : Dict[Dict]
+        the dictionary from the global MODELS (mutable so not a default argument),
+        but should be a dictionary of models, with requested lead times and timesteps
+    event_time : string
+        time of the event that we are hindcasting for
+    outpath : string
+        path to save out the data
+    req_models : List[string]
+        the requested models to download, used to index model_dict
+    crop_region : bool
+        if True, crops the region to the specified bounding box
+    lat_max, lat_min : float
+        the maximum and minimum latitude for the regional crop
+    lon_max, lon_min : float
+        the maximum and minimum longitude for the regional crop
+
+    Returns
+    --------
+    """
+    # first check the request is valid so any partially invalid requests will fail
+    for mod_name in req_models:
+        # loops over all the requested models and runs the check on them
+        mod_opts = model_dict[mod_name]
+        [check_request(mod_name, lead, event_time, mod_opts['dt']) for lead in mod_opts['LEAD_TIMES']]
+
+    # now basically do the same as above but actually download
+    for mod_name in req_models:
+        mod_opts = model_dict[mod_name]
+        
+        if mod_name == 'GFS'.casefold():
+            for lead in mod_opts['LEAD_TIMES']:
+                _,_ = download_gfs(
+                            EVENT_TIME, lead,
+                            outpath, dt=mod_opts['dt'], crop_domain=crop_region,
+                            lat_max=lat_max, lat_min=lat_min,
+                            lon_max=lon_max, lon_min=lon_min
+                            )
+                
+        if mod_name == 'HRRR'.casefold():
+            for lead in mod_opts['LEAD_TIMES']:
+                _,_ = download_hrrr(
+                            EVENT_TIME, lead, 
+                            outpath, dt=mod_opts['dt'], crop_domain=crop_region,
+                            lat_max=lat_max, lat_min=lat_min,
+                            lon_max=lon_max, lon_min=lon_min
+                            )
+                
+    
+    
+
+#----------------------------------------------------------------------------------------------------------------
+# GLOBALS
 
 # REQUIRED SETTINGS
 EVENT_TIME = "2021-09-03 00:00"  # YYYY-MM-DD hh:mm (when does the EVENT we are back forecasting happen)
-LEAD_TIME = 84                   # hours (how far in ADVANCE of the event do we want to get the forecast)
-OUTPATH = '/home/lt0663/Documents/hlm_forecast/gfs'  # where to save out the datasets
-MODELS_TO_PULL = ['gfs', 'hrrr']   # which of the supported models to download at this time
+OUTPATH = '/home/lt0663/Documents/hlm_forecast/data/gfs_checker'  # where to save out the datasets
+MODELS_TO_PULL = ['gfs']   # which of the supported models to download at this time
 
 # OPTIONAL CHANGES - currently same as function defaults
 CROP_REGION = True                      # do you want a subset of the full model domain when you download?
 LON_MIN, LON_MAX = -75.055, -74.229     # minimum and maximum longitude (set for Raritan AORC domain rn)
 LAT_MIN, LAT_MAX = 40.185, 41.024       # minimum and maximum latitude (set for Raritan AORC domain rn)
 
+# dictionary contains the requests for each model, if you don't want a model just leave it as is...
+# keys: LEAD_TIMES: hours (how far in ADVANCE of the event do we want to get the forecasts)
+#       dt : hours (interval between model steps to download at each lead time i.e. frequency of input to HLM)
 MODELS = {
     'gfs' : {
-        'LEAD_TIMES' : [360, 84]  # hours (how far in ADVANCE of the event do we want to get the forecasts)
+        'LEAD_TIMES' : np.arange(72,0,-12).tolist(),  # between 0 and 240, must be a multiple of 6 for GFS (runs available at 0z, 6z, 12z, 18z)
+        'dt' : 3                   # must be a multiple of 6 for GFS (minimum is 6 hours)
     },
 
     'hrrr' : {
-        'LEAD_TIMES' : [48, 36, 13]
+        'LEAD_TIMES' : np.arange(48,0,-12).tolist(),  # between 0 and 48, but 18-48 hours are only available for 0, 6, 12, 18Z runs
+        'dt' : 1                      # any because HRRR is hourly (minimum is 1 hour)
     }
 }
 
+# -----------------------------------------------------------------------------------------------------------------
+# Code executes here
 
+if __name__ == '__main__':
+    print("Downloading data for TigerHLM forecasting!")
 
-# download the data
-apcp_df, t2m_df = download_gfs(EVENT_TIME, LEAD_TIME, 
-                               OUTPATH, crop_domain=CROP_REGION,
-                               lat_max=LAT_MAX, lat_min=LAT_MIN,
-                               lon_max=LON_MAX, lon_min=LON_MIN)
-
+    download_driver(MODELS, EVENT_TIME, OUTPATH, 
+                    MODELS_TO_PULL, CROP_REGION,
+                    lat_max=LAT_MAX, lat_min=LAT_MIN,
+                    lon_max=LON_MAX, lon_min=LON_MIN)
+    
+    print(f"Success! Data can be found at {OUTPATH}")
+    print(f"It is highly recommended to check output! You can do this in quick_check_fcast.ipynb")
